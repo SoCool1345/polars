@@ -270,7 +270,70 @@ def test_spearman_corr_constant_column_29315() -> None:
     assert math.isnan(df.select(pl.corr("col1", "col2", method="spearman")).item())
 
 
-@pytest.mark.parametrize("n", [117, 245])
-def test_pearson_corr_zero_column_29315(n: int) -> None:
-    df = pl.DataFrame({"col1": [0.0] * n, "col2": list(range(n))})
+@pytest.mark.parametrize("n", [5, 117, 245, 2097])
+@pytest.mark.parametrize(
+    "constant", [0.0, 0.01, 0.3, 0.7, 1.0, 1e9, -9.570205894681823]
+)
+def test_pearson_corr_constant_column_29315(n: int, constant: float) -> None:
+    # A constant column is exactly degenerate, no matter the constant.
+    df = pl.DataFrame({"col1": [constant] * n, "col2": list(range(n))})
+
     assert math.isnan(df.select(pl.corr("col1", "col2")).item())
+    assert df.select(pl.cov("col1", "col2", ddof=0)).item() == 0.0
+    assert df.select(pl.cov("col1", "col2")).item() == 0.0
+    assert df.select(pl.col("col1").var(ddof=0)).item() == 0.0
+    assert df.select(pl.col("col1").var()).item() == 0.0
+    assert df.select(pl.col("col1").std(ddof=0)).item() == 0.0
+
+
+@pytest.mark.parametrize("constant", [0.01, 0.3, -9.570205894681823])
+def test_pearson_corr_constant_column_chunked_29315(constant: float) -> None:
+    # The same data, split over multiple chunks, must give the exact same result.
+    n = 2097
+    half = n // 2
+    single = pl.DataFrame({"col1": [constant] * n, "col2": list(range(n))})
+    chunked = pl.concat(
+        [
+            pl.DataFrame({"col1": [constant] * half, "col2": list(range(half))}),
+            pl.DataFrame(
+                {"col1": [constant] * (n - half), "col2": list(range(half, n))}
+            ),
+        ]
+    )
+    assert chunked.n_chunks() == 2
+
+    for df in (single, chunked):
+        assert math.isnan(df.select(pl.corr("col1", "col2")).item())
+        assert df.select(pl.cov("col1", "col2", ddof=0)).item() == 0.0
+        assert df.select(pl.col("col1").var(ddof=0)).item() == 0.0
+
+
+@pytest.mark.parametrize("constant", [0.01, 0.3, -9.570205894681823])
+def test_pearson_corr_constant_column_group_by_29315(constant: float) -> None:
+    # group_by and window aggregations must agree with the non-grouped path;
+    # the group sizes straddle the internal CHUNK_SIZE boundary.
+    sizes = [3, 117, 245, 1000]
+    df = pl.DataFrame(
+        {
+            "g": [str(i) for i, n in enumerate(sizes) for _ in range(n)],
+            "a": [constant] * sum(sizes),
+            "b": [float(i % 7 - 3) for i in range(sum(sizes))],
+        }
+    )
+
+    out = df.group_by("g").agg(
+        pl.corr("a", "b").alias("corr"),
+        pl.cov("a", "b", ddof=0).alias("cov"),
+        pl.col("a").var(ddof=0).alias("var"),
+    )
+    assert len(out) == len(sizes)
+    assert out["corr"].is_nan().all()
+    assert set(out["cov"].to_list()) == {0.0}
+    assert set(out["var"].to_list()) == {0.0}
+
+    windowed = df.select(
+        pl.corr("a", "b").over("g").alias("corr"),
+        pl.col("a").var(ddof=0).over("g").alias("var"),
+    )
+    assert windowed["corr"].is_nan().all()
+    assert windowed["var"].max() == 0.0

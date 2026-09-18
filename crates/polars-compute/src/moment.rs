@@ -36,6 +36,18 @@ use polars_utils::algebraic_ops::*;
 
 const CHUNK_SIZE: usize = 128;
 
+/// Arithmetic mean of `x`, anchored on its first element, so that the result
+/// does not depend on the summation order (the compiler may reassociate or
+/// vectorize the sum, and callers combine several chunks). Without an anchor a
+/// constant column can end up with a mean a few ulp off `x[0]`, which makes the
+/// deviations tiny but non-zero and turns `var`/`cov`/`corr` into ratios of
+/// such values. Here every deviation of a constant column is exactly `0.0`.
+#[inline]
+fn anchored_mean(x: &[f64], weight: f64) -> f64 {
+    let anchor = x[0];
+    anchor + alg_sum_f64(x.iter().map(|&xi| xi - anchor)) / weight
+}
+
 #[derive(Default, Clone)]
 #[repr(C)] // For serialization, don't change struct member order.
 pub struct VarState {
@@ -71,7 +83,7 @@ impl VarState {
         }
 
         let weight = x.len() as f64;
-        let mean = alg_sum_f64(x.iter().copied()) / weight;
+        let mean = anchored_mean(x, weight);
         Self {
             weight,
             mean,
@@ -142,8 +154,8 @@ impl CovState {
         }
 
         let weight = x.len() as f64;
-        let mean_x = alg_sum_f64(x.iter().copied()) / weight;
-        let mean_y = alg_sum_f64(y.iter().copied()) / weight;
+        let mean_x = anchored_mean(x, weight);
+        let mean_y = anchored_mean(y, weight);
         Self {
             weight,
             mean_x,
@@ -210,8 +222,8 @@ impl PearsonState {
         }
 
         let weight = x.len() as f64;
-        let mean_x = alg_sum_f64(x.iter().copied()) / weight;
-        let mean_y = alg_sum_f64(y.iter().copied()) / weight;
+        let mean_x = anchored_mean(x, weight);
+        let mean_y = anchored_mean(y, weight);
         let mut dp_xx = 0.0;
         let mut dp_xy = 0.0;
         let mut dp_yy = 0.0;
@@ -716,4 +728,245 @@ where
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A constant column must be *exactly* degenerate, no matter the constant.
+    const CONSTANTS: [f64; 7] = [0.0, 0.01, 0.3, 0.7, 1.0, 1.0e9, -9.570205894681823];
+
+    /// Lengths that don't line up with `CHUNK_SIZE`, plus very small and very
+    /// large ones.
+    const LENGTHS: [usize; 4] = [5, 117, 245, 2097];
+
+    /// Neumaier (compensated) summation, used as a high accuracy reference.
+    fn neumaier_sum(it: impl IntoIterator<Item = f64>) -> f64 {
+        let mut sum = 0.0f64;
+        let mut compensation = 0.0f64;
+        for value in it {
+            let new_sum = sum + value;
+            if sum.abs() >= value.abs() {
+                compensation += (sum - new_sum) + value;
+            } else {
+                compensation += (value - new_sum) + sum;
+            }
+            sum = new_sum;
+        }
+        sum + compensation
+    }
+
+    fn reference_mean(x: &[f64]) -> f64 {
+        neumaier_sum(x.iter().copied()) / x.len() as f64
+    }
+
+    fn reference_var(x: &[f64], ddof: f64) -> f64 {
+        let mean = reference_mean(x);
+        let dp = neumaier_sum(x.iter().map(|&xi| (xi - mean) * (xi - mean)));
+        dp / (x.len() as f64 - ddof)
+    }
+
+    fn reference_cov(x: &[f64], y: &[f64], ddof: f64) -> f64 {
+        let mean_x = reference_mean(x);
+        let mean_y = reference_mean(y);
+        let dp = neumaier_sum(
+            x.iter()
+                .zip(y)
+                .map(|(&xi, &yi)| (xi - mean_x) * (yi - mean_y)),
+        );
+        dp / (x.len() as f64 - ddof)
+    }
+
+    /// Deterministic pseudo-random values in `[-1, 1)`, so the tests don't need
+    /// an RNG dependency.
+    fn pseudo_random(n: usize, seed: u64) -> Vec<f64> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let unit = (state >> 11) as f64 / (1u64 << 53) as f64;
+                unit * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn assert_rel_eq(actual: f64, expected: f64, rtol: f64, msg: &str) {
+        let scale = expected.abs().max(f64::MIN_POSITIVE);
+        assert!(
+            (actual - expected).abs() <= rtol * scale,
+            "{msg}: actual={actual}, expected={expected}, rtol={rtol}"
+        );
+    }
+
+    /// A constant column has no variance at all: `var == 0`, `cov == 0` and
+    /// `corr == NaN`, for every constant, every length and both ddofs.
+    #[test]
+    fn test_constant_column_is_exactly_degenerate() {
+        for c in CONSTANTS {
+            for n in LENGTHS {
+                let x = vec![c; n];
+                // Two `y` shapes, so the result can't accidentally depend on the
+                // values of the other column.
+                let y_linear: Vec<f64> = (0..n).map(|i| i as f64).collect();
+                let y_periodic: Vec<f64> = (0..n).map(|i| (i % 7) as f64 - 3.0).collect();
+
+                let x_arr = PrimitiveArray::<f64>::from_slice(&x);
+
+                for ddof in [0, 1] {
+                    let got = var(&x_arr).finalize(ddof).unwrap();
+                    assert_eq!(got, 0.0, "var(c={c}, n={n}, ddof={ddof}) = {got}");
+                }
+
+                for y in [&y_linear, &y_periodic] {
+                    let y_arr = PrimitiveArray::<f64>::from_slice(y);
+
+                    for ddof in [0, 1] {
+                        let got = cov(&x_arr, &y_arr).finalize(ddof).unwrap();
+                        assert_eq!(got, 0.0, "cov(c={c}, n={n}, ddof={ddof}) = {got}");
+                    }
+
+                    let got = pearson_corr(&x_arr, &y_arr).finalize();
+                    assert!(
+                        got.is_nan(),
+                        "corr(c={c}, n={n}, len(y)={}) = {got}",
+                        y.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Chunking must not change the result: a chunk of a constant column has
+    /// exactly zero spread, so `combine()` keeps `dp == 0`.
+    #[test]
+    fn test_constant_column_across_chunks() {
+        for c in CONSTANTS {
+            for n in LENGTHS {
+                let x = vec![c; n];
+                let y: Vec<f64> = (0..n).map(|i| (i % 7) as f64 - 3.0).collect();
+
+                let mut layouts = vec![1, 2, 3, 7, 63, 127, 128, 129, 1024, n];
+                layouts.retain(|&chunk_size| chunk_size <= n);
+                layouts.dedup();
+
+                let mut results = Vec::new();
+                for &chunk_size in &layouts {
+                    let mut var_state = VarState::default();
+                    let mut cov_state = CovState::default();
+                    let mut corr_state = PearsonState::default();
+
+                    for (xc, yc) in x.chunks(chunk_size).zip(y.chunks(chunk_size)) {
+                        // The invariant that makes `combine()` exact.
+                        let chunk_var = VarState::new(xc);
+                        assert_eq!(chunk_var.mean, c, "mean(c={c}, chunk={chunk_size})");
+                        assert_eq!(chunk_var.dp, 0.0, "dp(c={c}, chunk={chunk_size})");
+
+                        var_state.combine(&chunk_var);
+                        cov_state.combine(&CovState::new(xc, yc));
+                        corr_state.combine(&PearsonState::new(xc, yc));
+                    }
+
+                    let var = var_state.finalize(0).unwrap();
+                    let cov = cov_state.finalize(0).unwrap();
+                    let corr = corr_state.finalize();
+                    assert_eq!(var, 0.0, "var(c={c}, n={n}, chunk={chunk_size}) = {var}");
+                    assert_eq!(cov, 0.0, "cov(c={c}, n={n}, chunk={chunk_size}) = {cov}");
+                    assert!(
+                        corr.is_nan(),
+                        "corr(c={c}, n={n}, chunk={chunk_size}) = {corr}"
+                    );
+                    results.push((var, cov, format!("{corr:?}")));
+                }
+
+                for result in results.iter().skip(1) {
+                    assert_eq!(
+                        result, &results[0],
+                        "chunk layout changed the result (c={c}, n={n})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Non-degenerate inputs must keep their accuracy: compare against a
+    /// compensated-summation reference, and check the analytic `corr == ±1`
+    /// case for exactly affine related columns.
+    #[test]
+    fn test_non_degenerate_not_regressed() {
+        for (n, seed) in [(64usize, 1u64), (245, 2), (1000, 3), (4097, 4)] {
+            let x = pseudo_random(n, seed);
+            let y = pseudo_random(n, seed.wrapping_mul(7919));
+            let x_arr = PrimitiveArray::<f64>::from_slice(&x);
+            let y_arr = PrimitiveArray::<f64>::from_slice(&y);
+
+            let expected_var_x = reference_var(&x, 1.0);
+            let expected_var_y = reference_var(&y, 1.0);
+            let expected_cov = reference_cov(&x, &y, 1.0);
+
+            assert_rel_eq(
+                var(&x_arr).finalize(1).unwrap(),
+                expected_var_x,
+                1e-12,
+                &format!("var(n={n})"),
+            );
+            assert_rel_eq(
+                cov(&x_arr, &y_arr).finalize(1).unwrap(),
+                expected_cov,
+                1e-12,
+                &format!("cov(n={n})"),
+            );
+
+            let corr = pearson_corr(&x_arr, &y_arr).finalize();
+            let expected_corr = expected_cov / (expected_var_x.sqrt() * expected_var_y.sqrt());
+            assert_rel_eq(corr, expected_corr, 1e-12, &format!("corr(n={n})"));
+            assert!(
+                corr.is_finite() && corr.abs() <= 1.0,
+                "corr(n={n}) = {corr}"
+            );
+        }
+
+        // An exact affine relation must give exactly ±1, for large inputs too.
+        let x: Vec<f64> = (0..2097).map(|i| i as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        let y_neg: Vec<f64> = x.iter().map(|&xi| -xi + 5.0).collect();
+        let x_arr = PrimitiveArray::<f64>::from_slice(&x);
+        assert_rel_eq(
+            pearson_corr(&x_arr, &PrimitiveArray::<f64>::from_slice(&y)).finalize(),
+            1.0,
+            1e-15,
+            "corr(x, 2x + 3)",
+        );
+        assert_rel_eq(
+            pearson_corr(&x_arr, &PrimitiveArray::<f64>::from_slice(&y_neg)).finalize(),
+            -1.0,
+            1e-15,
+            "corr(x, -x + 5)",
+        );
+    }
+
+    /// Chunked and unchunked results must agree for non-degenerate data as well.
+    #[test]
+    fn test_chunking_stability_non_degenerate() {
+        let n = 2100;
+        let x = pseudo_random(n, 42);
+        let y = pseudo_random(n, 1234);
+
+        let single = PearsonState::new(&x, &y).finalize();
+
+        for chunk_size in [128usize, 255, 512, 1024] {
+            let mut state = PearsonState::default();
+            for (xc, yc) in x.chunks(chunk_size).zip(y.chunks(chunk_size)) {
+                state.combine(&PearsonState::new(xc, yc));
+            }
+            assert_rel_eq(
+                state.finalize(),
+                single,
+                1e-12,
+                &format!("corr chunk_size={chunk_size}"),
+            );
+        }
+    }
 }
